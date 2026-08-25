@@ -1,0 +1,496 @@
+// RetailSync domain model — Phase 1
+// Every tenant-owned table carries organizationId directly (not just via a relation
+// chain) so every query can filter on it without a join, and so tenant isolation can
+// be enforced in one place (see src/lib/tenant-scope.ts, added in Phase 2 with auth).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Organization / Users / RBAC
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users                 User[]
+  branches              Branch[]
+  products              Product[]
+  customers             Customer[]
+  orders                Order[]
+  payments              Payment[]
+  inventory             Inventory[]
+  inventoryTransactions InventoryTransaction[]
+  alerts                Alert[]
+  apiKeys               ApiKey[]
+  auditLogs             AuditLog[]
+  transfers             Transfer[]
+}
+
+enum Role {
+  SUPER_ADMIN
+  OWNER
+  ADMIN
+  BRANCH_MANAGER
+  INVENTORY_MANAGER
+  CASHIER
+  SUPPORT_AGENT
+  ACCOUNTANT
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model User {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  email          String       @unique
+  passwordHash   String
+  name           String
+  role           Role
+  status         UserStatus   @default(ACTIVE)
+  emailVerifiedAt     DateTime?
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  // Optional restriction to specific branches. Empty array = unrestricted (subject to role).
+  branchIds      String[]     @default([])
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([organizationId])
+}
+
+// Same single-use, hashed-token pattern as PasswordResetToken.
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Revocable refresh tokens (session model). We never store the raw token — only a
+// sha256 hash of it — so a database read alone can't be used to impersonate a
+// session. Revoking is just setting revokedAt; login/logout/password-change all
+// go through this so "log out everywhere" and "reset password kills other
+// sessions" are real, not aspirational.
+model RefreshToken {
+  id         String    @id @default(cuid())
+  userId     String
+  tokenHash  String    @unique
+  userAgent  String?
+  ip         String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Single-use, time-limited password reset tokens. Only the hash is stored; the
+// raw token only ever exists in the emailed link and briefly in memory.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Branches
+// ---------------------------------------------------------------------------
+
+enum BranchStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Branch {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  code           String
+  address        String?
+  city           String?
+  state          String?
+  country        String?
+  phone          String?
+  email          String?
+  managerId      String?
+  status         BranchStatus @default(ACTIVE)
+  openingHours   Json?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  inventory Inventory[]
+  orders    Order[]
+  alerts    Alert[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Products
+// ---------------------------------------------------------------------------
+
+enum ProductStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model Product {
+  id              String        @id @default(cuid())
+  organizationId  String
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name            String
+  sku             String
+  barcode         String?
+  description     String?
+  category        String?
+  brand           String?
+  costPrice       Decimal       @db.Decimal(14, 2)
+  sellingPrice    Decimal       @db.Decimal(14, 2)
+  reorderLevel    Int           @default(0)
+  reorderQuantity Int           @default(0)
+  status          ProductStatus @default(ACTIVE)
+  images          String[]      @default([])
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  inventory  Inventory[]
+  orderItems OrderItem[]
+
+  @@unique([organizationId, sku])
+  @@index([organizationId, category])
+  @@index([organizationId, barcode])
+  @@index([organizationId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Inventory (the authoritative, per-branch stock record) + audit trail
+// ---------------------------------------------------------------------------
+
+model Inventory {
+  id               String   @id @default(cuid())
+  organizationId   String
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  productId        String
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  branchId         String
+  branch           Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  quantityOnHand   Int      @default(0)
+  quantityReserved Int      @default(0)
+  reorderLevel     Int      @default(0)
+  // Optimistic-concurrency guard, kept in addition to the row lock the inventory
+  // service takes (SELECT ... FOR UPDATE) — belt and braces, see inventory.service.ts.
+  version          Int      @default(0)
+  updatedAt        DateTime @updatedAt
+
+  // One inventory row per product per branch — this is what makes "reserve N units"
+  // a single-row atomic operation instead of a scan.
+  @@unique([productId, branchId])
+  @@index([organizationId])
+  @@index([branchId])
+  // quantityOnHand must never go negative; enforced in a migration-added CHECK
+  // constraint (see migration SQL) since Prisma doesn't yet emit CHECK from schema.
+}
+
+enum InventoryTransactionType {
+  PURCHASE
+  SALE
+  RESERVATION
+  RESERVATION_RELEASE
+  RETURN
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  TRANSFER_OUT
+  TRANSFER_IN
+  DAMAGE
+  LOSS
+}
+
+// Append-only ledger. Every inventory mutation writes exactly one row here, in the
+// same DB transaction as the Inventory update. Never mutate Inventory without one.
+model InventoryTransaction {
+  id               String                   @id @default(cuid())
+  organizationId   String
+  organization     Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  productId        String
+  branchId         String
+  type             InventoryTransactionType
+  quantity         Int
+  referenceType    String?
+  referenceId      String?
+  previousQuantity Int
+  newQuantity      Int
+  previousReserved Int
+  newReserved      Int
+  performedBy      String?
+  reason           String?
+  createdAt        DateTime                 @default(now())
+
+  @@index([organizationId, productId, branchId])
+  @@index([referenceType, referenceId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  phone          String?
+  email          String?
+  address        String?
+  notes          String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  orders Order[]
+
+  @@index([organizationId])
+  @@index([organizationId, phone])
+  @@index([organizationId, email])
+}
+
+// ---------------------------------------------------------------------------
+// Orders / Payments
+// ---------------------------------------------------------------------------
+
+enum OrderStatus {
+  DRAFT
+  PENDING_PAYMENT
+  PAID
+  PROCESSING
+  READY
+  COMPLETED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+model Order {
+  id                   String        @id @default(cuid())
+  organizationId       String
+  organization         Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchId             String
+  branch               Branch        @relation(fields: [branchId], references: [id])
+  customerId           String?
+  customer             Customer?     @relation(fields: [customerId], references: [id])
+  orderNumber          String
+  subtotal             Decimal       @db.Decimal(14, 2)
+  discount             Decimal       @db.Decimal(14, 2) @default(0)
+  tax                  Decimal       @db.Decimal(14, 2) @default(0)
+  deliveryFee          Decimal       @db.Decimal(14, 2) @default(0)
+  total                Decimal       @db.Decimal(14, 2)
+  currency             String        @default("NGN")
+  status               OrderStatus   @default(DRAFT)
+  paymentStatus        PaymentStatus @default(PENDING)
+  // When the inventory reservation backing this order expires if unpaid.
+  reservationExpiresAt DateTime?
+  // Client-supplied idempotency key so retried "create order" requests don't double-book.
+  idempotencyKey       String?
+  createdBy            String?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  items    OrderItem[]
+  payments Payment[]
+
+  @@unique([organizationId, orderNumber])
+  @@unique([organizationId, idempotencyKey])
+  @@index([organizationId, status])
+  @@index([organizationId, paymentStatus])
+  @@index([reservationExpiresAt])
+}
+
+model OrderItem {
+  id        String  @id @default(cuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  quantity  Int
+  unitPrice Decimal @db.Decimal(14, 2)
+  discount  Decimal @db.Decimal(14, 2) @default(0)
+  subtotal  Decimal @db.Decimal(14, 2)
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model Payment {
+  id               String        @id @default(cuid())
+  organizationId   String
+  organization     Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  orderId          String
+  order            Order         @relation(fields: [orderId], references: [id])
+  reference        String        @unique
+  provider         String        @default("paystack")
+  amount           Decimal       @db.Decimal(14, 2)
+  currency         String        @default("NGN")
+  status           PaymentStatus @default(PENDING)
+  authorizationUrl String?
+  // Every processed webhook event id gets appended here so a replayed webhook
+  // (Paystack resending the same event) is detected and skipped. See Phase 3.
+  processedEventIds String[]     @default([])
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  @@index([organizationId, status])
+  @@index([orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Alerts / Audit / API keys
+// ---------------------------------------------------------------------------
+
+enum AlertType {
+  LOW_STOCK
+  OUT_OF_STOCK
+  PAYMENT_FAILED
+  PAYMENT_EXPIRED
+  ORDER_EXPIRED
+  INVENTORY_ANOMALY
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model Alert {
+  id             String        @id @default(cuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  branchId       String?
+  branch         Branch?       @relation(fields: [branchId], references: [id])
+  type           AlertType
+  severity       AlertSeverity
+  title          String
+  message        String
+  entityType     String?
+  entityId       String?
+  read           Boolean       @default(false)
+  resolved       Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+
+  @@index([organizationId, resolved])
+  @@index([organizationId, type])
+}
+
+model ApiKey {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  name           String
+  // Only a salted hash is stored; the raw key is shown once at creation time and
+  // never again. See src/modules/api-keys (Phase 2).
+  hashedKey      String       @unique
+  keyPrefix      String
+  permissions    String[]     @default([])
+  createdAt      DateTime     @default(now())
+  lastUsedAt     DateTime?
+  revokedAt      DateTime?
+
+  @@index([organizationId])
+}
+
+model AuditLog {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actorId        String?
+  action         String
+  entityType     String
+  entityId       String
+  metadata       Json?
+  ip             String?
+  userAgent      String?
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Stock transfers between branches (service logic lands in a later phase;
+// modeled now so InventoryTransaction TRANSFER_IN/OUT reference something real)
+// ---------------------------------------------------------------------------
+
+enum TransferStatus {
+  REQUESTED
+  APPROVED
+  IN_TRANSIT
+  RECEIVED
+  CANCELLED
+}
+
+model Transfer {
+  id             String         @id @default(cuid())
+  organizationId String
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  fromBranchId   String
+  toBranchId     String
+  status         TransferStatus @default(REQUESTED)
+  createdBy      String?
+  approvedBy     String?
+  createdAt      DateTime       @default(now())
+  completedAt    DateTime?
+
+  items TransferItem[]
+
+  @@index([organizationId, status])
+}
+
+model TransferItem {
+  id         String   @id @default(cuid())
+  transferId String
+  transfer   Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  productId  String
+  quantity   Int
+
+  @@index([transferId])
+}
