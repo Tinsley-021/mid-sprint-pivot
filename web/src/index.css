@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+@theme {
+  /* RetailSync token system. The accent colors intentionally match the product's
+     own stock-status semantics: amber (=low-stock/attention), green (=in-stock),
+     red (=out-of-stock) — not arbitrary brand colors. */
+  --color-ink: #12151b;
+  --color-ink-soft: #1b1f27;
+  --color-paper: #ece8de;
+  --color-paper-dim: #d9d4c6;
+  --color-amber: #e8a33d;
+  --color-amber-dim: #c9862a;
+  --color-green: #4fae84;
+  --color-red: #e15b4d;
+  --color-slate: #5b6472;
+  --color-slate-soft: #8991a0;
+
+  --font-display: "Space Grotesk", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+@layer utilities {
+  @keyframes ledger-scroll {
+    from {
+      transform: translateY(0);
+    }
+    to {
+      transform: translateY(-50%);
+    }
+  }
+  .animate-ledger-scroll {
+    animation: ledger-scroll 14s linear infinite;
+  }
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    font-family: var(--font-body);
+    background-color: var(--color-ink);
+    color: var(--color-paper);
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-amber);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
